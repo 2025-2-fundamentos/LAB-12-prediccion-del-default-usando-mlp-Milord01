@@ -97,3 +97,172 @@
 # {'type': 'cm_matrix', 'dataset': 'train', 'true_0': {"predicted_0": 15562, "predicte_1": 666}, 'true_1': {"predicted_0": 3333, "predicted_1": 1444}}
 # {'type': 'cm_matrix', 'dataset': 'test', 'true_0': {"predicted_0": 15562, "predicte_1": 650}, 'true_1': {"predicted_0": 2490, "predicted_1": 1420}}
 #
+
+import json
+import gzip
+import pickle
+import os
+import pandas as pd
+from sklearn.neural_network import MLPClassifier
+from sklearn.model_selection import GridSearchCV
+from sklearn.preprocessing import OneHotEncoder, StandardScaler
+from sklearn.decomposition import PCA
+from sklearn.compose import ColumnTransformer
+from sklearn.pipeline import Pipeline
+from sklearn.feature_selection import SelectKBest, f_classif
+from sklearn.metrics import (
+    precision_score,
+    balanced_accuracy_score,
+    recall_score,
+    f1_score,
+    confusion_matrix,
+)
+
+
+def load_compressed_datasets():
+    train_dataset = pd.read_csv(
+        "./files/input/train_data.csv.zip",
+        index_col=False,
+        compression="zip",
+    )
+    test_dataset = pd.read_csv(
+        "./files/input/test_data.csv.zip",
+        index_col=False,
+        compression="zip",
+    )
+    return train_dataset, test_dataset
+
+
+def preprocess_dataframe(dataframe):
+    df = dataframe.copy()
+    df = df.rename(columns={"default payment next month": "default"})
+    df = df.drop(columns=["ID"])
+    df = df.loc[df["MARRIAGE"] != 0]
+    df = df.loc[df["EDUCATION"] != 0]
+    df["EDUCATION"] = df["EDUCATION"].apply(lambda x: 4 if x >= 4 else x)
+    df = df.dropna()
+    return df
+
+
+def separate_features_labels(dataframe):
+    features = dataframe.drop(columns=["default"])
+    labels = dataframe["default"]
+    return features, labels
+
+
+def build_neural_pipeline(feature_matrix):
+    cat_cols = ["SEX", "EDUCATION", "MARRIAGE"]
+    num_cols = [col for col in feature_matrix.columns if col not in cat_cols]
+    
+    transformer = ColumnTransformer(
+        transformers=[
+            ("cat", OneHotEncoder(), cat_cols),
+            ("scaler", StandardScaler(), num_cols),
+        ]
+    )
+    
+    model_pipeline = Pipeline(
+        steps=[
+            ("preprocessor", transformer),
+            ("feature_selection", SelectKBest(score_func=f_classif)),
+            ("pca", PCA()),
+            ("classifier", MLPClassifier(max_iter=500, random_state=21)),
+        ]
+    )
+    
+    return model_pipeline
+
+
+def train_with_grid_search(pipeline):
+    hyperparameter_grid = {
+        "pca__n_components": [None],
+        "feature_selection__k": [20],
+        "classifier__hidden_layer_sizes": [(50, 30, 40, 60)],
+        "classifier__alpha": [0.26],
+        "classifier__learning_rate_init": [0.001],
+    }
+    
+    grid_cv = GridSearchCV(
+        estimator=pipeline,
+        param_grid=hyperparameter_grid,
+        cv=5,
+        scoring="balanced_accuracy",
+        n_jobs=-1,
+        refit=True,
+    )
+    
+    return grid_cv
+
+
+def save_compressed_model(trained_model, output_path):
+    output_dir = os.path.dirname(output_path)
+    if os.path.exists(output_dir):
+        for file in os.listdir(output_dir):
+            os.remove(os.path.join(output_dir, file))
+    else:
+        os.makedirs(output_dir)
+    
+    with gzip.open(output_path, "wb") as file:
+        pickle.dump(trained_model, file)
+
+
+def compute_classification_metrics(split_name, true_labels, predicted_labels):
+    return {
+        "type": "metrics",
+        "dataset": split_name,
+        "precision": precision_score(true_labels, predicted_labels, zero_division=0),
+        "balanced_accuracy": balanced_accuracy_score(true_labels, predicted_labels),
+        "recall": recall_score(true_labels, predicted_labels, zero_division=0),
+        "f1_score": f1_score(true_labels, predicted_labels, zero_division=0),
+    }
+
+
+def compute_confusion_matrix_dict(split_name, true_labels, predicted_labels):
+    conf_matrix = confusion_matrix(true_labels, predicted_labels)
+    return {
+        "type": "cm_matrix",
+        "dataset": split_name,
+        "true_0": {"predicted_0": int(conf_matrix[0][0]), "predicted_1": int(conf_matrix[0][1])},
+        "true_1": {"predicted_0": int(conf_matrix[1][0]), "predicted_1": int(conf_matrix[1][1])},
+    }
+
+
+def save_all_metrics(metrics_list, output_file):
+    os.makedirs(os.path.dirname(output_file), exist_ok=True)
+    with open(output_file, "w", encoding="utf-8") as file:
+        for metric in metrics_list:
+            file.write(json.dumps(metric) + "\n")
+
+
+def main():
+    train_df, test_df = load_compressed_datasets()
+    
+    train_df = preprocess_dataframe(train_df)
+    test_df = preprocess_dataframe(test_df)
+    
+    X_train, y_train = separate_features_labels(train_df)
+    X_test, y_test = separate_features_labels(test_df)
+    
+    neural_pipeline = build_neural_pipeline(X_train)
+    
+    trained_model = train_with_grid_search(neural_pipeline)
+    trained_model.fit(X_train, y_train)
+    
+    save_compressed_model(trained_model, "files/models/model.pkl.gz")
+    
+    y_train_pred = trained_model.predict(X_train)
+    y_test_pred = trained_model.predict(X_test)
+    
+    train_metrics = compute_classification_metrics("train", y_train, y_train_pred)
+    test_metrics = compute_classification_metrics("test", y_test, y_test_pred)
+    
+    train_cm = compute_confusion_matrix_dict("train", y_train, y_train_pred)
+    test_cm = compute_confusion_matrix_dict("test", y_test, y_test_pred)
+    
+    all_metrics = [train_metrics, test_metrics, train_cm, test_cm]
+    save_all_metrics(all_metrics, "files/output/metrics.json")
+
+
+if __name__ == "__main__":
+    main()
+
